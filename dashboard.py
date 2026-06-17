@@ -1,0 +1,243 @@
+"""
+Sheets -> дашборд (GitHub Pages).
+Читает листы: "Dashboard" (все продавцы), "ROP dashboard" (команды),
+и любой другой лист -> отдельная страница продавца (новые подхватываются сами).
+Колонки: Имя | ЛИД | План | Факт1 | Факт2 | Транзакция | Конверсия | Выполнение плана.
+Генерит HTML и пушит в GitHub Pages. Запуск по cron каждые 10 минут.
+Ключи/пути - в переменных окружения (см. инструкцию внизу).
+"""
+
+import os, json, base64, ssl, urllib.request, urllib.error, logging
+from datetime import datetime, timezone, timedelta
+
+import gspread
+from google.oauth2.service_account import Credentials
+
+SHEET_ID    = os.environ.get("SHEET_ID", "1pufQB6lW_KrTgh_fEjhZSfNLUurpP8Z5T3maOX8P3tk")
+SA_JSON     = os.environ.get("SA_JSON_PATH", "/root/sheets_dashboard/service_account.json")
+GITHUB_TOKEN = os.environ.get("DASH_GITHUB_TOKEN", "")
+GITHUB_USER = os.environ.get("DASH_GITHUB_USER", "rustamov0277-cmd")
+GITHUB_REPO = os.environ.get("DASH_GITHUB_REPO", "sales-visual")
+GITHUB_FILE = "index.html"
+
+DASH_SHEET = "Dashboard"
+ROP_SHEET  = "ROP dashboard"
+TZ = timezone(timedelta(hours=5))
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
+log = logging.getLogger(__name__)
+
+def open_book():
+    scopes = ["https://www.googleapis.com/auth/spreadsheets.readonly"]
+    creds = Credentials.from_service_account_file(SA_JSON, scopes=scopes)
+    gc = gspread.authorize(creds)
+    return gc.open_by_key(SHEET_ID)
+
+def _num(v):
+    if v is None:
+        return None
+    s = str(v).strip().replace("\xa0", "").replace(" ", "").replace("%", "").replace(",", ".")
+    if not s or "DIV" in s or "REF" in s or s == "-":
+        return None
+    try:
+        return float(s)
+    except ValueError:
+        return None
+
+def parse_rows(ws):
+    values = ws.get_all_values()
+    header_idx = None
+    for i, r in enumerate(values[:5]):
+        joined = " ".join(c.upper() for c in r)
+        if "ЛИД" in joined:
+            header_idx = i
+            break
+    if header_idx is None:
+        header_idx = 0
+    rows = []
+    for r in values[header_idx + 1:]:
+        if not r or not r[0].strip():
+            continue
+        name = r[0].strip()
+        def col(i): return r[i] if i < len(r) else ""
+        leads = _num(col(1)); plan = _num(col(2))
+        fact1 = _num(col(3)); fact2 = _num(col(4))
+        trans = _num(col(5)); conv = _num(col(6)); plandone = _num(col(7))
+        if all(x is None for x in [leads, plan, fact1, fact2, trans]):
+            continue
+        rows.append({"name": name, "leads": leads, "plan": plan,
+                     "fact1": fact1, "fact2": fact2, "trans": trans,
+                     "conv": conv, "plandone": plandone})
+    return rows
+
+def safe_ws(book, title):
+    try:
+        return book.worksheet(title)
+    except Exception:
+        return None
+
+def collect():
+    book = open_book()
+    titles = [ws.title for ws in book.worksheets()]
+    data = {"period": "", "sellers": [], "rops": [], "people": {}}
+    ws_dash = safe_ws(book, DASH_SHEET)
+    if ws_dash:
+        data["sellers"] = parse_rows(ws_dash)
+    ws_rop = safe_ws(book, ROP_SHEET)
+    if ws_rop:
+        data["rops"] = parse_rows(ws_rop)
+        first = ws_rop.get_all_values()
+        if first and first[0]:
+            joined = " ".join(first[0])
+            if "202" in joined:
+                data["period"] = joined.strip()
+    for t in titles:
+        if t in (DASH_SHEET, ROP_SHEET):
+            continue
+        ws = safe_ws(book, t)
+        if not ws:
+            continue
+        rows = parse_rows(ws)
+        if rows:
+            data["people"][t] = rows
+    return data
+
+def generate_html(data):
+    updated = datetime.now(TZ).strftime("%d.%m.%Y %H:%M")
+    payload = json.dumps(data, ensure_ascii=False)
+
+    css = (
+        "@import url('https://fonts.googleapis.com/css2?family=Unbounded:wght@400;700;900&family=Inter:wght@300;400;500;600&display=swap');"
+        ":root{--bg:#0a0e14;--card:#141b24;--line:#26323f;--txt:#eef3f7;--mut:#7e90a2;--accent:#22c55e;--accent2:#06b6d4;}"
+        "*{box-sizing:border-box;margin:0;padding:0}"
+        "body{background:var(--bg);color:var(--txt);font-family:Inter,sans-serif;min-height:100vh}"
+        "header{padding:1.1rem 1.6rem;border-bottom:1px solid var(--line);background:linear-gradient(135deg,#0a0e14,#0d1a22);display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:.5rem}"
+        "header h1{font-family:Unbounded;font-size:1.05rem;font-weight:900;background:linear-gradient(135deg,#22c55e,#06b6d4);-webkit-background-clip:text;-webkit-text-fill-color:transparent}"
+        "header .upd{font-size:.72rem;color:var(--mut)}"
+        ".nav{display:flex;gap:.3rem;padding:.9rem 1.6rem 0;border-bottom:1px solid var(--line);overflow-x:auto;scrollbar-width:none}"
+        ".nav::-webkit-scrollbar{display:none}"
+        ".tab{padding:.45rem .9rem;border-radius:8px 8px 0 0;border:1px solid transparent;border-bottom:none;cursor:pointer;font-size:.74rem;font-weight:500;white-space:nowrap;color:var(--mut);background:transparent}"
+        ".tab:hover{color:var(--txt);background:var(--card)}"
+        ".tab.active{color:var(--txt);background:var(--card);border-color:var(--line)}"
+        ".content{padding:1.4rem 1.6rem}.panel{display:none}.panel.active{display:block}"
+        ".period{color:var(--mut);font-size:.78rem;padding:.8rem 1.6rem 0}"
+        "table{width:100%;border-collapse:collapse;border-radius:10px;overflow:hidden;border:1px solid var(--line);margin-bottom:1.2rem}"
+        "th{padding:.6rem .8rem;text-align:right;font-size:.62rem;color:#9fb0c0;text-transform:uppercase;letter-spacing:.05em;background:#0d141c;border-bottom:2px solid var(--line)}"
+        "th:nth-child(2){text-align:left}th:first-child{text-align:center}"
+        "td{padding:.7rem .8rem;text-align:right;font-size:.82rem;border-bottom:1px solid #1c2530}"
+        "td:nth-child(2){text-align:left;font-weight:600}td:first-child{text-align:center}"
+        "tr:last-child td{border-bottom:none}"
+        "tbody tr:nth-child(odd) td{background:#0f1620}tbody tr:nth-child(even) td{background:#131c27}"
+        "tbody tr:hover td{background:#1a2633!important}"
+        ".rank{font-family:Unbounded;font-weight:900;font-size:.8rem;color:var(--mut)}"
+        ".g1 td:first-child{border-left:3px solid #f59e0b}.g2 td:first-child{border-left:3px solid #94a3b8}.g3 td:first-child{border-left:3px solid #b45309}"
+        ".g1 .rank{color:#f59e0b}.g2 .rank{color:#94a3b8}.g3 .rank{color:#b45309}"
+        ".money{font-family:Unbounded;font-weight:700;font-size:.8rem}"
+        ".bg{background:rgba(34,197,94,.15);color:#22c55e;padding:.15rem .5rem;border-radius:5px;font-size:.72rem;font-weight:700;display:inline-block}"
+        ".br{background:rgba(239,68,68,.15);color:#f87171;padding:.15rem .5rem;border-radius:5px;font-size:.72rem;font-weight:700;display:inline-block}"
+        ".by{background:rgba(245,158,11,.15);color:#fbbf24;padding:.15rem .5rem;border-radius:5px;font-size:.72rem;font-weight:700;display:inline-block}"
+        ".cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:.7rem;margin-bottom:1.2rem}"
+        ".c{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:1rem}"
+        ".c .l{font-size:.62rem;color:var(--mut);text-transform:uppercase;letter-spacing:.05em;margin-bottom:.35rem}"
+        ".c .v{font-family:Unbounded;font-size:1.15rem;font-weight:700;line-height:1.1}"
+        ".bar{height:7px;border-radius:4px;background:#1c2530;min-width:70px;flex:1}"
+        ".barf{height:100%;border-radius:4px;background:linear-gradient(90deg,#06b6d4,#22c55e)}"
+        ".barf.over{background:linear-gradient(90deg,#22c55e,#84cc16)}"
+        ".pw{display:flex;align-items:center;gap:.5rem}.pp{font-family:Unbounded;font-size:.78rem;font-weight:700;min-width:42px;text-align:right}"
+        ".empty{color:var(--mut);text-align:center;padding:2rem;font-size:.85rem}"
+    )
+
+    js = (
+        "var D=" + payload + ";"
+        "function money(v){if(v==null)return '-';return Math.round(v).toLocaleString('ru-RU')}"
+        "function num(v){if(v==null)return '-';return Math.round(v).toLocaleString('ru-RU')}"
+        "function pct(v){if(v==null)return '-';return Math.round(v)+'%'}"
+        "function medal(i){return i===0?'1':i===1?'2':i===2?'3':(i+1)}"
+        "function rc(i){return i===0?'g1':i===1?'g2':i===2?'g3':''}"
+        "function convOf(p){if(p.conv!=null)return p.conv;if(p.leads)return p.trans/p.leads*100;return null}"
+        "function planOf(p){if(p.plandone!=null)return p.plandone;if(p.plan)return p.fact2/p.plan*100;return null}"
+        "function rankTable(rows,title){var r=rows.filter(function(p){return p.fact2!=null}).sort(function(a,b){return (b.fact2||0)-(a.fact2||0)});"
+        "if(!r.length)return '<div class=\"empty\">Malumot yo`q</div>';"
+        "var body=r.map(function(p,i){var pl=planOf(p);var col=pl==null?'var(--mut)':pl>=100?'#22c55e':pl>=70?'#06b6d4':'#f87171';var fc=pl>=100?' over':'';"
+        "var cv=convOf(p);var cb=cv==null?'-':cv>=40?('<span class=\"bg\">'+pct(cv)+'</span>'):cv>=25?('<span class=\"by\">'+pct(cv)+'</span>'):('<span class=\"br\">'+pct(cv)+'</span>');"
+        "return '<tr class=\"'+rc(i)+'\"><td class=\"rank\">'+medal(i)+'</td><td>'+p.name+'</td>'"
+        "+'<td class=\"money\" style=\"color:#22c55e\">'+money(p.fact2)+'</td>'"
+        "+'<td style=\"color:#9fb0c0\">'+money(p.fact1)+'</td>'"
+        "+'<td>'+num(p.trans)+'</td>'"
+        "+'<td>'+num(p.leads)+'</td>'"
+        "+'<td>'+cb+'</td>'"
+        "+'<td style=\"min-width:130px\"><div class=\"pw\"><div class=\"bar\"><div class=\"barf'+fc+'\" style=\"width:'+Math.min(pl||0,100)+'%\"></div></div><span class=\"pp\" style=\"color:'+col+'\">'+pct(pl)+'</span></div></td></tr>'}).join('');"
+        "return '<table><thead><tr><th>#</th><th>'+title+'</th><th>Uspeshka (Fakt2)</th><th>Zakazlar (Fakt1)</th><th>Tranz.</th><th>Lid</th><th>Konv.</th><th>Plan bajarish</th></tr></thead><tbody>'+body+'</tbody></table>'}"
+        "function personPage(name,rows){var p=rows[0]||{};var cv=convOf(p),pl=planOf(p);"
+        "return '<div class=\"cards\">'"
+        "+'<div class=\"c\"><div class=\"l\">Lid</div><div class=\"v\">'+num(p.leads)+'</div></div>'"
+        "+'<div class=\"c\"><div class=\"l\">Tranzaksiya</div><div class=\"v\">'+num(p.trans)+'</div></div>'"
+        "+'<div class=\"c\"><div class=\"l\">Uspeshka (Fakt2)</div><div class=\"v\" style=\"color:#22c55e;font-size:.95rem\">'+money(p.fact2)+'</div></div>'"
+        "+'<div class=\"c\"><div class=\"l\">Zakazlar (Fakt1)</div><div class=\"v\" style=\"font-size:.95rem\">'+money(p.fact1)+'</div></div>'"
+        "+'<div class=\"c\"><div class=\"l\">Plan</div><div class=\"v\" style=\"font-size:.95rem;color:#9fb0c0\">'+money(p.plan)+'</div></div>'"
+        "+'<div class=\"c\"><div class=\"l\">Konversiya</div><div class=\"v\" style=\"color:#06b6d4\">'+pct(cv)+'</div></div>'"
+        "+'<div class=\"c\"><div class=\"l\">Plan bajarish</div><div class=\"v\" style=\"color:'+(pl>=100?'#22c55e':'#06b6d4')+'\">'+pct(pl)+'</div></div>'"
+        "+'</div>'}"
+        "var nav=document.getElementById('nav'),content=document.getElementById('content');"
+        "var tabs=[];"
+        "tabs.push(['Sotuvchilar',function(){return rankTable(D.sellers||[],'Sotuvchi')}]);"
+        "tabs.push(['Komandalar',function(){return rankTable(D.rops||[],'ROP / Komanda')}]);"
+        "tabs.forEach(function(t,i){var b=document.createElement('button');b.className='tab'+(i===0?' active':'');b.textContent=t[0];b.onclick=(function(i){return function(){sw(i)}})(i);nav.appendChild(b);var pn=document.createElement('div');pn.className='panel'+(i===0?' active':'');pn.id='p'+i;pn.innerHTML=t[1]();content.appendChild(pn)});"
+        "var names=Object.keys(D.people||{}).sort();"
+        "names.forEach(function(name,k){var idx=k+2;var b=document.createElement('button');b.className='tab';b.textContent=name;b.onclick=(function(idx){return function(){sw(idx)}})(idx);nav.appendChild(b);var pn=document.createElement('div');pn.className='panel';pn.id='p'+idx;pn.innerHTML='<h2 style=\"font-family:Unbounded;font-size:1rem;margin-bottom:1rem\">'+name+'</h2>'+personPage(name,D.people[name]);content.appendChild(pn)});"
+        "function sw(i){document.querySelectorAll('.tab').forEach(function(t,k){t.classList.toggle('active',k===i)});document.querySelectorAll('.panel').forEach(function(p,k){p.classList.toggle('active',k===i)})}"
+        "setTimeout(function(){location.reload()},600000);"
+    )
+
+    period = data.get("period") or ""
+    return ('<!DOCTYPE html><html lang="uz"><head><meta charset="utf-8">'
+            '<meta name="viewport" content="width=device-width, initial-scale=1">'
+            '<title>Sotuvchilar dashboard</title><style>' + css + '</style></head><body>'
+            '<header><h1>Sotuvchilar dashboardi</h1><span class="upd">Yangilandi: ' + updated + '</span></header>'
+            '<div class="period">' + period + '</div>'
+            '<div class="nav" id="nav"></div><div class="content" id="content"></div>'
+            '<script>' + js + '</script></body></html>')
+
+def push_github(html):
+    if not GITHUB_TOKEN:
+        log.error("DASH_GITHUB_TOKEN yoq - push qilinmadi")
+        return False
+    api = "https://api.github.com/repos/" + GITHUB_USER + "/" + GITHUB_REPO + "/contents/" + GITHUB_FILE
+    headers = {"Authorization": "token " + GITHUB_TOKEN,
+               "Accept": "application/vnd.github.v3+json",
+               "User-Agent": "sheets-dashboard"}
+    ctx = ssl._create_unverified_context()
+    sha = None
+    try:
+        req = urllib.request.Request(api, headers=headers)
+        with urllib.request.urlopen(req, context=ctx) as r:
+            sha = json.loads(r.read())["sha"]
+    except urllib.error.HTTPError as e:
+        if e.code != 404:
+            log.error("SHA error: %s", e)
+    payload = {"message": "dashboard " + datetime.now(TZ).strftime("%d.%m %H:%M"),
+               "content": base64.b64encode(html.encode()).decode()}
+    if sha:
+        payload["sha"] = sha
+    try:
+        data = json.dumps(payload).encode()
+        req = urllib.request.Request(api, data=data, headers=headers, method="PUT")
+        with urllib.request.urlopen(req, context=ctx) as r:
+            log.info("GitHub push OK: %s", r.status)
+            return True
+    except Exception as e:
+        log.error("push error: %s", e)
+        return False
+
+if __name__ == "__main__":
+    try:
+        data = collect()
+        log.info("Oqildi: sotuvchi=%d, komanda=%d, shaxsiy varaq=%d",
+                 len(data["sellers"]), len(data["rops"]), len(data["people"]))
+        html = generate_html(data)
+        with open("/root/sheets_dashboard/index.html", "w", encoding="utf-8") as f:
+            f.write(html)
+        push_github(html)
+    except Exception as e:
+        log.error("FATAL: %s", e)
+        raise
