@@ -118,34 +118,21 @@ def safe_ws(book, title):
 
 def collect():
     book = open_book()
+    # один запрос метаданных — берём названия листов
     worksheets = book.worksheets()
     titles = [ws.title for ws in worksheets]
     data = {"period": "", "sellers": [], "rops": [], "people": {}}
 
-    # ВСЕ листы одним батч-запросом (вместо 70 отдельных) — обход лимита 429
-    # читаем диапазон A1:I60 у каждого листа
+    # ВСЕ листы одним батч-запросом значений
     ranges = ["'" + t.replace("'", "''") + "'!A1:I60" for t in titles]
+    sheets_values = {}
     try:
         batch = book.values_batch_get(ranges)
-        value_ranges = batch.get("valueRanges", [])
-    except Exception as e:
-        log.error("batch_get error: %s — fallback по одному", e)
-        value_ranges = None
-
-    sheets_values = {}
-    if value_ranges is not None:
-        for t, vr in zip(titles, value_ranges):
+        for t, vr in zip(titles, batch.get("valueRanges", [])):
             sheets_values[t] = vr.get("values", [])
-    else:
-        # запасной путь — по одному (медленно, но работает)
-        import time
-        for ws in worksheets:
-            try:
-                sheets_values[ws.title] = ws.get_all_values()
-                time.sleep(1.1)
-            except Exception as e:
-                log.error("read %s: %s", ws.title, e)
-                sheets_values[ws.title] = []
+    except Exception as e:
+        log.error("batch_get error: %s", e)
+        raise
 
     # Dashboard
     if DASH_SHEET in sheets_values:
@@ -332,14 +319,24 @@ def push_github(html):
         return False
 
 if __name__ == "__main__":
-    try:
-        data = collect()
-        log.info("Oqildi: sotuvchi=%d, komanda=%d, shaxsiy varaq=%d",
-                 len(data["sellers"]), len(data["rops"]), len(data["people"]))
-        html = generate_html(data)
-        with open("/root/sheets_dashboard/index.html", "w", encoding="utf-8") as f:
-            f.write(html)
-        push_github(html)
-    except Exception as e:
-        log.error("FATAL: %s", e)
-        raise
+    import time
+    attempts = 0
+    while True:
+        attempts += 1
+        try:
+            data = collect()
+            log.info("Oqildi: sotuvchi=%d, komanda=%d, shaxsiy varaq=%d",
+                     len(data["sellers"]), len(data["rops"]), len(data["people"]))
+            html = generate_html(data)
+            with open("/root/sheets_dashboard/index.html", "w", encoding="utf-8") as f:
+                f.write(html)
+            push_github(html)
+            break
+        except Exception as e:
+            msg = str(e)
+            if "429" in msg and attempts < 4:
+                log.error("429 limit — 65 сония кутиб қайта урунаман (urinish %d)", attempts)
+                time.sleep(65)
+                continue
+            log.error("FATAL: %s", e)
+            raise
