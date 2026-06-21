@@ -70,6 +70,46 @@ def parse_rows(ws):
                      "conv": conv, "plandone": plandone})
     return rows
 
+def parse_person(ws):
+    """Лист продавца: дневные строки + строка 'Общий' (итог накопительно) + ФОТ.
+    Возвращает {total, days}."""
+    values = ws.get_all_values()
+    header_idx = None
+    for i, r in enumerate(values[:6]):
+        joined = " ".join(c.upper() for c in r)
+        if "ЛИД" in joined:
+            header_idx = i
+            break
+    if header_idx is None:
+        header_idx = 0
+    days = []
+    total = None
+    for r in values[header_idx + 1:]:
+        if not r or not r[0].strip():
+            continue
+        first = r[0].strip()
+        def col(i): return r[i] if i < len(r) else ""
+        rec = {"date": first,
+               "leads": _num(col(1)), "plan": _num(col(2)),
+               "fact1": _num(col(3)), "fact2": _num(col(4)),
+               "trans": _num(col(5)), "conv": _num(col(6)),
+               "plandone": _num(col(7)), "fot": _num(col(8))}
+        if first.lower() in ("общий", "итого", "jami", "umumiy", "всего"):
+            total = rec
+            continue
+        if any(rec[k] is not None for k in ("leads", "fact1", "fact2", "trans")):
+            days.append(rec)
+    if total is None and days:
+        def s(k): return sum(d[k] or 0 for d in days)
+        leads = s("leads"); plan = s("plan"); fot = s("fot")
+        fact1 = s("fact1"); fact2 = s("fact2"); trans = s("trans")
+        total = {"date": "Общий", "leads": leads, "plan": plan,
+                 "fact1": fact1, "fact2": fact2, "trans": trans,
+                 "conv": round(trans/leads*100, 1) if leads else None,
+                 "plandone": round(fact2/plan*100, 1) if plan else None,
+                 "fot": fot}
+    return {"total": total or {}, "days": days}
+
 def safe_ws(book, title):
     try:
         return book.worksheet(title)
@@ -97,9 +137,9 @@ def collect():
         ws = safe_ws(book, t)
         if not ws:
             continue
-        rows = parse_rows(ws)
-        if rows:
-            data["people"][t] = rows
+        person = parse_person(ws)
+        if person["total"] or person["days"]:
+            data["people"][t] = person
     return data
 
 def generate_html(data):
@@ -156,6 +196,14 @@ def generate_html(data):
         "function rc(i){return i===0?'g1':i===1?'g2':i===2?'g3':''}"
         "function convOf(p){if(p.conv!=null)return p.conv;if(p.leads)return p.trans/p.leads*100;return null}"
         "function planOf(p){if(p.plandone!=null)return p.plandone;if(p.plan)return p.fact2/p.plan*100;return null}"
+        "function idInRange(name){var m=(name||'').match(/(\\d{2,4})\\s*$/);if(!m)return false;var id=parseInt(m[1]);return id>=107&&id<=147}"
+        "function bonusInfo(name,fact2){"
+        "var tiers=[[70000000,2000000],[60000000,1500000],[45000000,1000000]];"
+        "if(!idInRange(name))return null;"
+        "var cur=0,curTier=0;for(var i=0;i<tiers.length;i++){if(fact2>=tiers[i][0]){cur=tiers[i][1];curTier=tiers[i][0];break}}"
+        "var next=null,nextBonus=null;var asc=[[45000000,1000000],[60000000,1500000],[70000000,2000000]];"
+        "for(var j=0;j<asc.length;j++){if(fact2<asc[j][0]){next=asc[j][0];nextBonus=asc[j][1];break}}"
+        "return {current:cur,next:next,nextBonus:nextBonus,remain:next?next-fact2:0,maxed:cur===2000000}}"
         "function rankTable(rows,title){var r=rows.filter(function(p){return p.fact2!=null}).sort(function(a,b){return (b.fact2||0)-(a.fact2||0)});"
         "if(!r.length)return '<div class=\"empty\">Malumot yo`q</div>';"
         "var body=r.map(function(p,i){var pl=planOf(p);var col=pl==null?'var(--mut)':pl>=100?'#22c55e':pl>=70?'#06b6d4':'#f87171';var fc=pl>=100?' over':'';"
@@ -168,8 +216,8 @@ def generate_html(data):
         "+'<td>'+cb+'</td>'"
         "+'<td style=\"min-width:130px\"><div class=\"pw\"><div class=\"bar\"><div class=\"barf'+fc+'\" style=\"width:'+Math.min(pl||0,100)+'%\"></div></div><span class=\"pp\" style=\"color:'+col+'\">'+pct(pl)+'</span></div></td></tr>'}).join('');"
         "return '<table><thead><tr><th>#</th><th>'+title+'</th><th>Uspeshka (Fakt2)</th><th>Zakazlar (Fakt1)</th><th>Tranz.</th><th>Lid</th><th>Konv.</th><th>Plan bajarish</th></tr></thead><tbody>'+body+'</tbody></table>'}"
-        "function personPage(name,rows){var p=rows[0]||{};var cv=convOf(p),pl=planOf(p);"
-        "return '<div class=\"cards\">'"
+        "function personPage(name,obj){var p=(obj&&obj.total)||{};var days=(obj&&obj.days)||[];var cv=convOf(p),pl=planOf(p);"
+        "var cards='<div class=\"cards\">'"
         "+'<div class=\"c\"><div class=\"l\">Lid</div><div class=\"v\">'+num(p.leads)+'</div></div>'"
         "+'<div class=\"c\"><div class=\"l\">Tranzaksiya</div><div class=\"v\">'+num(p.trans)+'</div></div>'"
         "+'<div class=\"c\"><div class=\"l\">Uspeshka (Fakt2)</div><div class=\"v\" style=\"color:#22c55e;font-size:.95rem\">'+money(p.fact2)+'</div></div>'"
@@ -177,7 +225,33 @@ def generate_html(data):
         "+'<div class=\"c\"><div class=\"l\">Plan</div><div class=\"v\" style=\"font-size:.95rem;color:#9fb0c0\">'+money(p.plan)+'</div></div>'"
         "+'<div class=\"c\"><div class=\"l\">Konversiya</div><div class=\"v\" style=\"color:#06b6d4\">'+pct(cv)+'</div></div>'"
         "+'<div class=\"c\"><div class=\"l\">Plan bajarish</div><div class=\"v\" style=\"color:'+(pl>=100?'#22c55e':'#06b6d4')+'\">'+pct(pl)+'</div></div>'"
-        "+'</div>'}"
+        "+'<div class=\"c\" style=\"border-color:#3a2f0a\"><div class=\"l\">FOT (ish haqi)</div><div class=\"v\" style=\"color:#fbbf24;font-size:.95rem\">'+money(p.fot)+'</div></div>'"
+        "+'</div>';"
+        "var bi=bonusInfo(name,p.fact2||0);var bonusBlock='';"
+        "if(bi){var bcol=bi.current>0?'#22c55e':'#7e90a2';"
+        "var line1='<div style=\"font-size:.7rem;color:var(--mut);text-transform:uppercase;letter-spacing:.05em;margin-bottom:.5rem\">Bonus</div>';"
+        "var line2='<div style=\"display:flex;align-items:baseline;gap:.5rem;margin-bottom:.6rem\"><span style=\"font-family:Unbounded;font-size:1.4rem;font-weight:800;color:'+bcol+'\">'+money(bi.current)+'</span><span style=\"font-size:.75rem;color:var(--mut)\">hozirgi bonus</span></div>';"
+        "var line3='';"
+        "if(bi.maxed){line3='<div style=\"color:#22c55e;font-size:.85rem;font-weight:600\">Maksimal bonusga yetdingiz!</div>'}"
+        "else if(bi.next){var pctp=Math.min((p.fact2||0)/bi.next*100,100);"
+        "line3='<div style=\"font-size:.82rem;color:#eef3f7;margin-bottom:.4rem\">Keyingi bonus <b style=\"color:#fbbf24\">'+money(bi.nextBonus)+'</b> uchun yana <b style=\"color:#06b6d4\">'+money(bi.remain)+' sum</b> kerak</div>'"
+        "+'<div style=\"height:9px;border-radius:5px;background:#1c2530\"><div style=\"height:100%;border-radius:5px;width:'+pctp+'%;background:linear-gradient(90deg,#06b6d4,#22c55e)\"></div></div>'"
+        "+'<div style=\"font-size:.68rem;color:var(--mut);margin-top:.3rem\">'+money(p.fact2)+' / '+money(bi.next)+'</div>'}"
+        "bonusBlock='<div style=\"background:var(--card);border:1px solid #3a2f0a;border-radius:12px;padding:1.1rem;margin-top:1rem\">'+line1+line2+line3+'</div>'}"
+        "var chartId='ch_'+name.replace(/[^a-zA-Z0-9]/g,'');"
+        "var chartBlock=days.length?('<div style=\"background:var(--card);border:1px solid var(--line);border-radius:12px;padding:1rem;margin-top:1rem\"><div style=\"font-size:.7rem;color:var(--mut);text-transform:uppercase;letter-spacing:.05em;margin-bottom:.7rem\">Kunlik dinamika: Lid, Fakt1 va Fakt2</div><canvas id=\"'+chartId+'\" height=\"90\"></canvas></div>'):'';"
+        "return cards+bonusBlock+chartBlock}"
+        "function drawCharts(){Object.keys(D.people||{}).forEach(function(name){var obj=D.people[name];var days=(obj&&obj.days)||[];if(!days.length)return;var cid='ch_'+name.replace(/[^a-zA-Z0-9]/g,'');var cv=document.getElementById(cid);if(!cv||cv.dataset.done)return;cv.dataset.done='1';"
+        "var labels=days.map(function(d){return (d.date||'').slice(0,5)});"
+        "var leads=days.map(function(d){return d.leads||0});var sales=days.map(function(d){return (d.fact2||0)/1000000});var orders=days.map(function(d){return (d.fact1||0)/1000000});"
+        "new Chart(cv,{type:'bar',data:{labels:labels,datasets:["
+        "{type:'line',label:'Lid',data:leads,borderColor:'#06b6d4',backgroundColor:'#06b6d4',yAxisID:'y1',tension:.3,pointRadius:2,order:0},"
+        "{type:'bar',label:'Zakazlar Fakt1 (mln)',data:orders,backgroundColor:'#f59e0b88',borderColor:'#f59e0b',yAxisID:'y',order:2},"
+        "{type:'bar',label:'Uspeshka Fakt2 (mln)',data:sales,backgroundColor:'#22c55e88',borderColor:'#22c55e',yAxisID:'y',order:1}]},"
+        "options:{responsive:true,plugins:{legend:{labels:{color:'#9fb0c0',font:{size:10}}}},scales:{"
+        "x:{ticks:{color:'#64748b',font:{size:9}},grid:{color:'#1c2530'}},"
+        "y:{position:'left',ticks:{color:'#22c55e',font:{size:9}},grid:{color:'#1c2530'}},"
+        "y1:{position:'right',ticks:{color:'#06b6d4',font:{size:9}},grid:{display:false}}}}})})}"
         "var nav=document.getElementById('nav'),content=document.getElementById('content');"
         "var tabs=[];"
         "tabs.push(['Sotuvchilar',function(){return rankTable(D.sellers||[],'Sotuvchi')}]);"
@@ -185,14 +259,17 @@ def generate_html(data):
         "tabs.forEach(function(t,i){var b=document.createElement('button');b.className='tab'+(i===0?' active':'');b.textContent=t[0];b.onclick=(function(i){return function(){sw(i)}})(i);nav.appendChild(b);var pn=document.createElement('div');pn.className='panel'+(i===0?' active':'');pn.id='p'+i;pn.innerHTML=t[1]();content.appendChild(pn)});"
         "var names=Object.keys(D.people||{}).sort();"
         "names.forEach(function(name,k){var idx=k+2;var b=document.createElement('button');b.className='tab';b.textContent=name;b.onclick=(function(idx){return function(){sw(idx)}})(idx);nav.appendChild(b);var pn=document.createElement('div');pn.className='panel';pn.id='p'+idx;pn.innerHTML='<h2 style=\"font-family:Unbounded;font-size:1rem;margin-bottom:1rem\">'+name+'</h2>'+personPage(name,D.people[name]);content.appendChild(pn)});"
-        "function sw(i){document.querySelectorAll('.tab').forEach(function(t,k){t.classList.toggle('active',k===i)});document.querySelectorAll('.panel').forEach(function(p,k){p.classList.toggle('active',k===i)})}"
+        "function sw(i){document.querySelectorAll('.tab').forEach(function(t,k){t.classList.toggle('active',k===i)});document.querySelectorAll('.panel').forEach(function(p,k){p.classList.toggle('active',k===i)});if(window.Chart)drawCharts()}"
         "setTimeout(function(){location.reload()},600000);"
+        "if(window.Chart)drawCharts();"
     )
 
     period = data.get("period") or ""
     return ('<!DOCTYPE html><html lang="uz"><head><meta charset="utf-8">'
             '<meta name="viewport" content="width=device-width, initial-scale=1">'
-            '<title>Sotuvchilar dashboard</title><style>' + css + '</style></head><body>'
+            '<title>Sotuvchilar dashboard</title>'
+            '<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.0/chart.umd.min.js"></script>'
+            '<style>' + css + '</style></head><body>'
             '<header><h1>Sotuvchilar dashboardi</h1><span class="upd">Yangilandi: ' + updated + '</span></header>'
             '<div class="period">' + period + '</div>'
             '<div class="nav" id="nav"></div><div class="content" id="content"></div>'
