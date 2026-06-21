@@ -44,8 +44,7 @@ def _num(v):
     except ValueError:
         return None
 
-def parse_rows(ws):
-    values = ws.get_all_values()
+def parse_rows_values(values):
     header_idx = None
     for i, r in enumerate(values[:5]):
         joined = " ".join(c.upper() for c in r)
@@ -70,10 +69,11 @@ def parse_rows(ws):
                      "conv": conv, "plandone": plandone})
     return rows
 
-def parse_person(ws):
-    """Лист продавца: дневные строки + строка 'Общий' (итог накопительно) + ФОТ.
-    Возвращает {total, days}."""
-    values = ws.get_all_values()
+def parse_rows(ws):
+    return parse_rows_values(ws.get_all_values())
+
+def parse_person_values(values):
+    """values (list of rows) -> {total, days}."""
     header_idx = None
     for i, r in enumerate(values[:6]):
         joined = " ".join(c.upper() for c in r)
@@ -118,26 +118,51 @@ def safe_ws(book, title):
 
 def collect():
     book = open_book()
-    titles = [ws.title for ws in book.worksheets()]
+    worksheets = book.worksheets()
+    titles = [ws.title for ws in worksheets]
     data = {"period": "", "sellers": [], "rops": [], "people": {}}
-    ws_dash = safe_ws(book, DASH_SHEET)
-    if ws_dash:
-        data["sellers"] = parse_rows(ws_dash)
-    ws_rop = safe_ws(book, ROP_SHEET)
-    if ws_rop:
-        data["rops"] = parse_rows(ws_rop)
-        first = ws_rop.get_all_values()
-        if first and first[0]:
-            joined = " ".join(first[0])
+
+    # ВСЕ листы одним батч-запросом (вместо 70 отдельных) — обход лимита 429
+    # читаем диапазон A1:I60 у каждого листа
+    ranges = ["'" + t.replace("'", "''") + "'!A1:I60" for t in titles]
+    try:
+        batch = book.values_batch_get(ranges)
+        value_ranges = batch.get("valueRanges", [])
+    except Exception as e:
+        log.error("batch_get error: %s — fallback по одному", e)
+        value_ranges = None
+
+    sheets_values = {}
+    if value_ranges is not None:
+        for t, vr in zip(titles, value_ranges):
+            sheets_values[t] = vr.get("values", [])
+    else:
+        # запасной путь — по одному (медленно, но работает)
+        import time
+        for ws in worksheets:
+            try:
+                sheets_values[ws.title] = ws.get_all_values()
+                time.sleep(1.1)
+            except Exception as e:
+                log.error("read %s: %s", ws.title, e)
+                sheets_values[ws.title] = []
+
+    # Dashboard
+    if DASH_SHEET in sheets_values:
+        data["sellers"] = parse_rows_values(sheets_values[DASH_SHEET])
+    # ROP dashboard
+    if ROP_SHEET in sheets_values:
+        rv = sheets_values[ROP_SHEET]
+        data["rops"] = parse_rows_values(rv)
+        if rv and rv[0]:
+            joined = " ".join(rv[0])
             if "202" in joined:
                 data["period"] = joined.strip()
+    # каждый продавец
     for t in titles:
         if t in (DASH_SHEET, ROP_SHEET):
             continue
-        ws = safe_ws(book, t)
-        if not ws:
-            continue
-        person = parse_person(ws)
+        person = parse_person_values(sheets_values.get(t, []))
         if person["total"] or person["days"]:
             data["people"][t] = person
     return data
