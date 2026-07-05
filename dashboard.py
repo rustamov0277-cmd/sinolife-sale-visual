@@ -58,6 +58,9 @@ def parse_rows_values(values):
         if not r or not r[0].strip():
             continue
         name = r[0].strip()
+        # "Общий"/"Жами" итог қаторини ўтказиб юборамиз
+        if name.lower() in ("общий", "итого", "jami", "umumiy", "всего", "jami:", "общий:"):
+            continue
         def col(i): return r[i] if i < len(r) else ""
         leads = _num(col(1)); plan = _num(col(2))
         fact1 = _num(col(3)); fact2 = _num(col(4))
@@ -124,7 +127,7 @@ def collect():
     data = {"period": "", "sellers": [], "rops": [], "people": {}}
 
     # ВСЕ листы батч-запросами по частям — выдержит 150-200+ листов
-    ranges = ["'" + t.replace("'", "''") + "'!A1:I60" for t in titles]
+    ranges = ["'" + t.replace("'", "''") + "'!A1:I250" for t in titles]
     sheets_values = {}
     CHUNK = 30
     import time as _t
