@@ -1,10 +1,10 @@
 """
 Sheets -> дашборд (GitHub Pages).
 Читает листы: "Dashboard" (все продавцы), "ROP dashboard" (команды),
-и любой другой лист -> отдельная страница продавца (новые подхватываются сами).
+и любой другой лист -> отдельная страница продавца.
 Колонки: Имя | ЛИД | План | Факт1 | Факт2 | Транзакция | Конверсия | Выполнение плана.
-Генерит HTML и пушит в GitHub Pages. Запуск по cron каждые 10 минут.
-Ключи/пути - в переменных окружения (см. инструкцию внизу).
+РОП командаси Bitrix24'дан олинади (rop_map.py) ва сотувчи ёнида рангли кўрсатилади.
+Запуск по cron каждые 10 минут.
 """
 
 import os, sys, json, base64, ssl, urllib.request, urllib.error, logging
@@ -13,9 +13,12 @@ from datetime import datetime, timezone, timedelta
 import gspread
 from google.oauth2.service_account import Credentials
 
+try:
+    import rop_map
+except Exception:
+    rop_map = None
+
 SHEET_ID    = os.environ.get("SHEET_ID", "1pufQB6lW_KrTgh_fEjhZSfNLUurpP8Z5T3maOX8P3tk")
-# config-файл со списком месяцев (лист "Oylar": Oy nomi | Sheet ID | Faol).
-# Если не задан — используем SHEET_ID как единственный месяц.
 CONFIG_SHEET_ID = os.environ.get("CONFIG_SHEET_ID", "")
 SA_JSON     = os.environ.get("SA_JSON_PATH", "/root/sheets_dashboard/service_account.json")
 GITHUB_TOKEN = os.environ.get("DASH_GITHUB_TOKEN", "")
@@ -40,7 +43,6 @@ def open_book(sheet_id=None):
     return _gc().open_by_key(sheet_id or SHEET_ID)
 
 def load_months():
-    """Читает config-лист 'Oylar' -> [{'name','id'}]. Если конфига нет — один месяц."""
     if not CONFIG_SHEET_ID:
         return [{"name": "Жорий ой", "id": SHEET_ID}]
     try:
@@ -87,7 +89,6 @@ def parse_rows_values(values):
         if not r or not r[0].strip():
             continue
         name = r[0].strip()
-        # "Общий"/"Жами" итог қаторини ўтказиб юборамиз
         if name.lower() in ("общий", "итого", "jami", "umumiy", "всего", "jami:", "общий:"):
             continue
         def col(i): return r[i] if i < len(r) else ""
@@ -105,7 +106,6 @@ def parse_rows(ws):
     return parse_rows_values(ws.get_all_values())
 
 def parse_person_values(values):
-    """values (list of rows) -> {total, days}."""
     header_idx = None
     for i, r in enumerate(values[:6]):
         joined = " ".join(c.upper() for c in r)
@@ -150,12 +150,10 @@ def safe_ws(book, title):
 
 def collect(sheet_id=None):
     book = open_book(sheet_id)
-    # один запрос метаданных — берём названия листов
     worksheets = book.worksheets()
     titles = [ws.title for ws in worksheets]
     data = {"period": "", "sellers": [], "rops": [], "people": {}}
 
-    # ВСЕ листы батч-запросами по частям — выдержит 150-200+ листов
     ranges = ["'" + t.replace("'", "''") + "'!A1:I250" for t in titles]
     sheets_values = {}
     CHUNK = 30
@@ -163,7 +161,6 @@ def collect(sheet_id=None):
     for start in range(0, len(ranges), CHUNK):
         chunk_titles = titles[start:start + CHUNK]
         chunk_ranges = ranges[start:start + CHUNK]
-        # до 3 попыток на каждую часть (на случай 429)
         for attempt in range(3):
             try:
                 batch = book.values_batch_get(chunk_ranges)
@@ -178,13 +175,27 @@ def collect(sheet_id=None):
                 log.error("batch chunk %d error: %s", start // CHUNK, e)
                 break
         if start + CHUNK < len(ranges):
-            _t.sleep(1.5)  # пауза между частями
-    log.info("Jami varaqlar o'qildi: %d / %d", len(sheets_values), len(titles))
+            _t.sleep(1.5)
     log.info("Jami varaqlar o'qildi: %d / %d", len(sheets_values), len(titles))
 
-    # Dashboard
+    # Dashboard + РОП боғлаш
     if DASH_SHEET in sheets_values:
         data["sellers"] = parse_rows_values(sheets_values[DASH_SHEET])
+        try:
+            rmap = rop_map.load() if rop_map else {}
+        except Exception as e:
+            log.error("rop_map: %s", e)
+            rmap = {}
+        if rmap:
+            n = 0
+            for s in data["sellers"]:
+                s["rop"] = rop_map.rop_of(s["name"], rmap)
+                if s["rop"]:
+                    n += 1
+            log.info("РОП боғланди: %d / %d сотувчи", n, len(data["sellers"]))
+        else:
+            log.warning("РОП харитаси бўш — устун тўлмайди")
+
     # ROP dashboard
     if ROP_SHEET in sheets_values:
         rv = sheets_values[ROP_SHEET]
@@ -193,7 +204,8 @@ def collect(sheet_id=None):
             joined = " ".join(rv[0])
             if "202" in joined:
                 data["period"] = joined.strip()
-    # каждый продавец
+
+    # ҳар сотувчи
     for t in titles:
         if t in (DASH_SHEET, ROP_SHEET):
             continue
@@ -203,10 +215,16 @@ def collect(sheet_id=None):
     return data
 
 def generate_html(all_months):
-    """all_months = [{'name':..., 'data':{...}}]. Первый — текущий (по умолчанию)."""
     updated = datetime.now(TZ).strftime("%d.%m.%Y %H:%M")
-    # payload: {months:[{name,data}], default:0}
     payload = json.dumps({"months": all_months}, ensure_ascii=False)
+
+    # ҳар РОПга доимий ранг
+    rops = sorted(set(s.get("rop") for m in all_months
+                      for s in m["data"].get("sellers", []) if s.get("rop")))
+    palette = ["#22c55e", "#06b6d4", "#f59e0b", "#a78bfa", "#f472b6",
+               "#38bdf8", "#fb923c", "#4ade80", "#e879f9", "#facc15"]
+    rop_colors = dict((r, palette[i % len(palette)]) for i, r in enumerate(rops))
+    log.info("РОП ранглари: %s", ", ".join(rops) if rops else "йўқ")
 
     css = (
         "@import url('https://fonts.googleapis.com/css2?family=Unbounded:wght@400;700;900&family=Inter:wght@300;400;500;600&display=swap');"
@@ -235,6 +253,9 @@ def generate_html(all_months):
         ".g1 td:first-child{border-left:3px solid #f59e0b}.g2 td:first-child{border-left:3px solid #94a3b8}.g3 td:first-child{border-left:3px solid #b45309}"
         ".g1 .rank{color:#f59e0b}.g2 .rank{color:#94a3b8}.g3 .rank{color:#b45309}"
         ".money{font-family:Unbounded;font-weight:700;font-size:.8rem}"
+        ".ropb{font-size:.66rem;font-weight:700;padding:.18rem .55rem;border-radius:6px;"
+        "white-space:nowrap;display:inline-block;letter-spacing:.02em}"
+        ".ropcell{text-align:left!important}"
         ".bg{background:rgba(34,197,94,.15);color:#22c55e;padding:.15rem .5rem;border-radius:5px;font-size:.72rem;font-weight:700;display:inline-block}"
         ".br{background:rgba(239,68,68,.15);color:#f87171;padding:.15rem .5rem;border-radius:5px;font-size:.72rem;font-weight:700;display:inline-block}"
         ".by{background:rgba(245,158,11,.15);color:#fbbf24;padding:.15rem .5rem;border-radius:5px;font-size:.72rem;font-weight:700;display:inline-block}"
@@ -255,6 +276,7 @@ def generate_html(all_months):
 
     js = (
         "var ALL=" + payload + ";"
+        "var ROPC=" + json.dumps(rop_colors, ensure_ascii=False) + ";"
         "var _mi=0;"
         "var D=(ALL.months[_mi]||{}).data||{sellers:[],rops:[],people:{},period:''};"
         "function money(v){if(v==null)return '-';return Math.round(v).toLocaleString('ru-RU')}"
@@ -264,6 +286,9 @@ def generate_html(all_months):
         "function rc(i){return i===0?'g1':i===1?'g2':i===2?'g3':''}"
         "function convOf(p){if(p.conv!=null)return p.conv;if(p.leads)return p.trans/p.leads*100;return null}"
         "function planOf(p){if(p.plandone!=null)return p.plandone;if(p.plan)return p.fact2/p.plan*100;return null}"
+        "function ropBadge(p){if(!p.rop)return '<td class=\"ropcell\"></td>';"
+        "var c=ROPC[p.rop]||'#7e90a2';"
+        "return '<td class=\"ropcell\"><span class=\"ropb\" style=\"background:'+c+'26;color:'+c+'\">'+p.rop+'</span></td>'}"
         "function forecast(fact2){"
         "if(fact2==null||fact2<=0)return null;"
         "if(!(ALL.months[_mi]&&ALL.months[_mi].current))return fact2;"
@@ -281,11 +306,12 @@ def generate_html(all_months):
         "var next=null,nextBonus=null;var asc=[[45000000,1000000],[60000000,1500000],[70000000,2000000]];"
         "for(var j=0;j<asc.length;j++){if(fact2<asc[j][0]){next=asc[j][0];nextBonus=asc[j][1];break}}"
         "return {current:cur,next:next,nextBonus:nextBonus,remain:next?next-fact2:0,maxed:cur===2000000}}"
-        "function rankTable(rows,title){var r=rows.filter(function(p){return p.fact2!=null}).sort(function(a,b){return (b.fact2||0)-(a.fact2||0)});"
+        "function rankTable(rows,title,showRop){var r=rows.filter(function(p){return p.fact2!=null}).sort(function(a,b){return (b.fact2||0)-(a.fact2||0)});"
         "if(!r.length)return '<div class=\"empty\">Malumot yo`q</div>';"
         "var body=r.map(function(p,i){var pl=planOf(p);var col=pl==null?'var(--mut)':pl>=100?'#22c55e':pl>=70?'#06b6d4':'#f87171';var fc=pl>=100?' over':'';"
         "var cv=convOf(p);var cb=cv==null?'-':cv>=40?('<span class=\"bg\">'+pct(cv)+'</span>'):cv>=25?('<span class=\"by\">'+pct(cv)+'</span>'):('<span class=\"br\">'+pct(cv)+'</span>');"
         "return '<tr class=\"'+rc(i)+'\"><td class=\"rank\">'+medal(i)+'</td><td>'+p.name+'</td>'"
+        "+(showRop?ropBadge(p):'')"
         "+'<td class=\"money\" style=\"color:#22c55e\">'+money(p.fact2)+'</td>'"
         "+'<td style=\"color:#9fb0c0\">'+money(p.fact1)+'</td>'"
         "+'<td>'+num(p.trans)+'</td>'"
@@ -296,7 +322,7 @@ def generate_html(all_months):
         "var frcol=(p.plan&&fr>=p.plan)?'#22c55e':(p.plan&&fr>=p.plan*0.8)?'#fbbf24':'#f87171';"
         "return '<td class=\"money\" style=\"color:'+frcol+'\">'+money(fr)+'</td>'})()"
         "+'</tr>'}).join('');"
-        "return '<table><thead><tr><th>#</th><th>'+title+'</th><th>Uspeshka (Fakt2)</th><th>Zakazlar (Fakt1)</th><th>Tranz.</th><th>Lid</th><th>Konv.</th><th>Plan bajarish</th><th>Prognoz (oy oxiri)</th></tr></thead><tbody>'+body+'</tbody></table>'}"
+        "return '<table><thead><tr><th>#</th><th>'+title+'</th>'+(showRop?'<th style=\"text-align:left\">ROP</th>':'')+'<th>Uspeshka (Fakt2)</th><th>Zakazlar (Fakt1)</th><th>Tranz.</th><th>Lid</th><th>Konv.</th><th>Plan bajarish</th><th>Prognoz (oy oxiri)</th></tr></thead><tbody>'+body+'</tbody></table>'}"
         "function personPage(name,obj){var p=(obj&&obj.total)||{};var days=(obj&&obj.days)||[];var cv=convOf(p),pl=planOf(p);"
         "var cards='<div class=\"cards\">'"
         "+'<div class=\"c\"><div class=\"l\">Lid</div><div class=\"v\">'+num(p.leads)+'</div></div>'"
@@ -337,8 +363,8 @@ def generate_html(all_months):
         "function buildTabs(){"
         "nav.innerHTML='';content.innerHTML='';"
         "var tabs=[];"
-        "tabs.push(['Sotuvchilar',function(){return rankTable(D.sellers||[],'Sotuvchi')}]);"
-        "tabs.push(['Komandalar',function(){return rankTable(D.rops||[],'ROP / Komanda')}]);"
+        "tabs.push(['Sotuvchilar',function(){return rankTable(D.sellers||[],'Sotuvchi',1)}]);"
+        "tabs.push(['Komandalar',function(){return rankTable(D.rops||[],'ROP / Komanda',0)}]);"
         "tabs.forEach(function(t,i){var b=document.createElement('button');b.className='tab'+(i===0?' active':'');b.textContent=t[0];b.onclick=(function(i){return function(){sw(i)}})(i);nav.appendChild(b);var pn=document.createElement('div');pn.className='panel'+(i===0?' active':'');pn.id='p'+i;pn.innerHTML=t[1]();content.appendChild(pn)});"
         "var names=Object.keys(D.people||{}).sort(function(a,b){var ia=extractId(a),ib=extractId(b);if(ia!==ib)return ia-ib;return a.localeCompare(b)});"
         "names.forEach(function(name,k){var idx=k+2;var b=document.createElement('button');b.className='tab';b.textContent=name;b.onclick=(function(idx){return function(){sw(idx)}})(idx);nav.appendChild(b);var pn=document.createElement('div');pn.className='panel';pn.id='p'+idx;pn.innerHTML='<h2 style=\"font-family:Unbounded;font-size:1rem;margin-bottom:1rem\">'+name+'</h2>'+personPage(name,D.people[name]);content.appendChild(pn)});"
@@ -419,7 +445,7 @@ if __name__ == "__main__":
                     time.sleep(65); continue
                 log.error("Oy '%s' xato: %s — o'tkazib yuboraman", m["name"], e)
                 break
-        time.sleep(2)  # пауза между месяцами
+        time.sleep(2)
     if not all_months:
         log.error("FATAL: hech qanday oy o'qilmadi"); sys.exit(1)
     html = generate_html(all_months)
