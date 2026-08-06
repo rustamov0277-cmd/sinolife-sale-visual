@@ -79,11 +79,13 @@ def fetch():
     log.info("Bitrix: %d бўлим, %d ходим, %d рақам РОПга боғланди",
              len(depts), len(users), len(out))
     return out
+_FAILED = False
 
 
 def load(force=False):
     """Кэшдан ўқийди, эскирган бўлса Bitrix'дан янгилайди.
-    Bitrix ишламаса — эски кэш қайтарилади (дашборд бузилмайди)."""
+    Bitrix ишламаса — шу ишга тушишда бошқа урингмайди (вақт тежалади)."""
+    global _FAILED
     cache, ts = {}, 0
     if os.path.exists(CACHE_FILE):
         try:
@@ -95,6 +97,8 @@ def load(force=False):
 
     if not force and cache and (time.time() - ts) < CACHE_TTL:
         return cache
+    if _FAILED and not force:
+        return cache
 
     try:
         fresh = fetch()
@@ -103,9 +107,9 @@ def load(force=False):
                 json.dump({"ts": time.time(), "map": fresh}, f, ensure_ascii=False)
             return fresh
     except Exception as e:
+        _FAILED = True
         log.error("⚠️ Bitrix'дан РОП олинмади (%s) — эски кэш ишлатилади", str(e)[:150])
     return cache
-
 
 def num_of(name):
     """'Азиза Вафокулова 112' → '112'"""
