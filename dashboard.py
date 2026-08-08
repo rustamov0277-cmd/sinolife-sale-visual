@@ -2,12 +2,13 @@
 Sheets -> дашборд (GitHub Pages).
 Читает листы: "Dashboard" (все продавцы), "ROP dashboard" (команды),
 и любой другой лист -> отдельная страница продавца.
-Колонки: Имя | ЛИД | План | Факт1 | Факт2 | Транзакция | Конверсия | Выполнение плана.
-РОП командаси Bitrix24'дан олинади (rop_map.py) ва сотувчи ёнида рангли кўрсатилади.
+РОП командаси Bitrix24'дан олинади (rop_map.py), сотувчи ёнида рангли кўрсатилади.
+
+v2: ойлар автомат тартибланади (янгиси биринчи) · жадвалларда ЖАМИ қатори.
 Запуск по cron каждые 10 минут.
 """
 
-import os, sys, json, base64, ssl, urllib.request, urllib.error, logging
+import os, re, sys, json, base64, ssl, urllib.request, urllib.error, logging
 from datetime import datetime, timezone, timedelta
 
 import gspread
@@ -34,24 +35,60 @@ TZ = timezone(timedelta(hours=5))
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
 log = logging.getLogger(__name__)
 
+# ── ой номи → рақам (рус/ўзбек) ───────────────────────────────────────────
+MONTH_WORDS = [
+    ("январ", 1), ("yanvar", 1),
+    ("феврал", 2), ("fevral", 2),
+    ("март", 3), ("mart", 3),
+    ("апрел", 4), ("aprel", 4),
+    ("май", 5), ("may", 5),
+    ("июн", 6), ("iyun", 6),
+    ("июл", 7), ("iyul", 7),
+    ("август", 8), ("avgust", 8),
+    ("сентябр", 9), ("sentabr", 9),
+    ("октябр", 10), ("oktabr", 10),
+    ("ноябр", 11), ("noyabr", 11),
+    ("декабр", 12), ("dekabr", 12),
+]
+
+
+def month_key(name):
+    """'Август 2026' → (2026, 8). Танилмаса (0,0) — охирига тушади."""
+    n = str(name or "").strip().lower()
+    y = 0
+    m = re.search(r"(20\d{2})", n)
+    if m:
+        y = int(m.group(1))
+    mo = 0
+    for word, num in MONTH_WORDS:
+        if word in n:
+            mo = num
+            break
+    return (y, mo)
+
+
 def _gc():
     scopes = ["https://www.googleapis.com/auth/spreadsheets.readonly"]
     creds = Credentials.from_service_account_file(SA_JSON, scopes=scopes)
     return gspread.authorize(creds)
 
+
 def open_book(sheet_id=None):
     return _gc().open_by_key(sheet_id or SHEET_ID)
 
+
 def load_months():
+    """Ойларни ўқийди ва ЯНГИСИДАН эскисига тартиблайди.
+    Биринчи ой = жорий ой (прогноз ўшанга ҳисобланади)."""
     if not CONFIG_SHEET_ID:
         return [{"name": "Жорий ой", "id": SHEET_ID}]
     try:
         book = _gc().open_by_key(CONFIG_SHEET_ID)
-        ws = book.worksheet(CONFIG_WS)
-        rows = ws.get_all_values()
+        rows = book.worksheet(CONFIG_WS).get_all_values()
     except Exception as e:
         log.error("config o'qilmadi: %s — bitta oy ishlatamiz", e)
         return [{"name": "Жорий ой", "id": SHEET_ID}]
+
     months = []
     for r in rows[1:]:
         if len(r) < 2 or not r[0].strip() or not r[1].strip():
@@ -61,6 +98,9 @@ def load_months():
             months.append({"name": r[0].strip(), "id": r[1].strip()})
     if not months:
         return [{"name": "Жорий ой", "id": SHEET_ID}]
+
+    months.sort(key=lambda m: month_key(m["name"]), reverse=True)
+    log.info("Ойлар тартиби: %s", " → ".join(m["name"] for m in months))
     return months
 
 
@@ -74,6 +114,7 @@ def _num(v):
         return float(s)
     except ValueError:
         return None
+
 
 def parse_rows_values(values):
     header_idx = None
@@ -102,8 +143,10 @@ def parse_rows_values(values):
                      "conv": conv, "plandone": plandone})
     return rows
 
+
 def parse_rows(ws):
     return parse_rows_values(ws.get_all_values())
+
 
 def parse_person_values(values):
     header_idx = None
@@ -142,11 +185,13 @@ def parse_person_values(values):
                  "fot": fot}
     return {"total": total or {}, "days": days}
 
+
 def safe_ws(book, title):
     try:
         return book.worksheet(title)
     except Exception:
         return None
+
 
 def collect(sheet_id=None):
     book = open_book(sheet_id)
@@ -214,11 +259,11 @@ def collect(sheet_id=None):
             data["people"][t] = person
     return data
 
+
 def generate_html(all_months):
     updated = datetime.now(TZ).strftime("%d.%m.%Y %H:%M")
     payload = json.dumps({"months": all_months}, ensure_ascii=False)
 
-    # ҳар РОПга доимий ранг
     rops = sorted(set(s.get("rop") for m in all_months
                       for s in m["data"].get("sellers", []) if s.get("rop")))
     palette = ["#22c55e", "#06b6d4", "#f59e0b", "#a78bfa", "#f472b6",
@@ -246,9 +291,11 @@ def generate_html(all_months):
         "th:nth-child(2){text-align:left}th:first-child{text-align:center}"
         "td{padding:.7rem .8rem;text-align:right;font-size:.82rem;border-bottom:1px solid #1c2530}"
         "td:nth-child(2){text-align:left;font-weight:600}td:first-child{text-align:center}"
-        "tr:last-child td{border-bottom:none}"
         "tbody tr:nth-child(odd) td{background:#0f1620}tbody tr:nth-child(even) td{background:#131c27}"
         "tbody tr:hover td{background:#1a2633!important}"
+        "tfoot td{background:#0d1a22!important;font-weight:800;font-size:.86rem;"
+        "border-top:2px solid var(--accent);border-bottom:none;padding:.85rem .8rem}"
+        "tfoot .jami{font-family:Unbounded;font-size:.78rem;letter-spacing:.04em;color:var(--accent)}"
         ".rank{font-family:Unbounded;font-weight:900;font-size:.8rem;color:var(--mut)}"
         ".g1 td:first-child{border-left:3px solid #f59e0b}.g2 td:first-child{border-left:3px solid #94a3b8}.g3 td:first-child{border-left:3px solid #b45309}"
         ".g1 .rank{color:#f59e0b}.g2 .rank{color:#94a3b8}.g3 .rank{color:#b45309}"
@@ -306,6 +353,21 @@ def generate_html(all_months):
         "var next=null,nextBonus=null;var asc=[[45000000,1000000],[60000000,1500000],[70000000,2000000]];"
         "for(var j=0;j<asc.length;j++){if(fact2<asc[j][0]){next=asc[j][0];nextBonus=asc[j][1];break}}"
         "return {current:cur,next:next,nextBonus:nextBonus,remain:next?next-fact2:0,maxed:cur===2000000}}"
+        /* ── ЖАМИ қатори ── */
+        "function totalRow(r,showRop){"
+        "var t={fact2:0,fact1:0,trans:0,leads:0,plan:0,fr:0};"
+        "r.forEach(function(p){t.fact2+=p.fact2||0;t.fact1+=p.fact1||0;t.trans+=p.trans||0;"
+        "t.leads+=p.leads||0;t.plan+=p.plan||0;var f=forecast(p.fact2);t.fr+=(f||0)});"
+        "var cv=t.leads?t.trans/t.leads*100:null;var pl=t.plan?t.fact2/t.plan*100:null;"
+        "var pcol=pl==null?'var(--mut)':pl>=100?'#22c55e':pl>=70?'#06b6d4':'#f87171';"
+        "return '<tfoot><tr><td></td><td class=\"jami\">JAMI ('+r.length+')</td>'"
+        "+(showRop?'<td></td>':'')"
+        "+'<td class=\"money\" style=\"color:#22c55e\">'+money(t.fact2)+'</td>'"
+        "+'<td style=\"color:#9fb0c0\">'+money(t.fact1)+'</td>'"
+        "+'<td>'+num(t.trans)+'</td><td>'+num(t.leads)+'</td>'"
+        "+'<td>'+pct(cv)+'</td>'"
+        "+'<td style=\"color:'+pcol+'\">'+pct(pl)+'</td>'"
+        "+'<td class=\"money\">'+money(t.fr)+'</td></tr></tfoot>'}"
         "function rankTable(rows,title,showRop){var r=rows.filter(function(p){return p.fact2!=null}).sort(function(a,b){return (b.fact2||0)-(a.fact2||0)});"
         "if(!r.length)return '<div class=\"empty\">Malumot yo`q</div>';"
         "var body=r.map(function(p,i){var pl=planOf(p);var col=pl==null?'var(--mut)':pl>=100?'#22c55e':pl>=70?'#06b6d4':'#f87171';var fc=pl>=100?' over':'';"
@@ -322,7 +384,7 @@ def generate_html(all_months):
         "var frcol=(p.plan&&fr>=p.plan)?'#22c55e':(p.plan&&fr>=p.plan*0.8)?'#fbbf24':'#f87171';"
         "return '<td class=\"money\" style=\"color:'+frcol+'\">'+money(fr)+'</td>'})()"
         "+'</tr>'}).join('');"
-        "return '<table><thead><tr><th>#</th><th>'+title+'</th>'+(showRop?'<th style=\"text-align:left\">ROP</th>':'')+'<th>Uspeshka (Fakt2)</th><th>Zakazlar (Fakt1)</th><th>Tranz.</th><th>Lid</th><th>Konv.</th><th>Plan bajarish</th><th>Prognoz (oy oxiri)</th></tr></thead><tbody>'+body+'</tbody></table>'}"
+        "return '<table><thead><tr><th>#</th><th>'+title+'</th>'+(showRop?'<th style=\"text-align:left\">ROP</th>':'')+'<th>Uspeshka (Fakt2)</th><th>Zakazlar (Fakt1)</th><th>Tranz.</th><th>Lid</th><th>Konv.</th><th>Plan bajarish</th><th>Prognoz (oy oxiri)</th></tr></thead><tbody>'+body+'</tbody>'+totalRow(r,showRop)+'</table>'}"
         "function personPage(name,obj){var p=(obj&&obj.total)||{};var days=(obj&&obj.days)||[];var cv=convOf(p),pl=planOf(p);"
         "var cards='<div class=\"cards\">'"
         "+'<div class=\"c\"><div class=\"l\">Lid</div><div class=\"v\">'+num(p.leads)+'</div></div>'"
@@ -392,6 +454,7 @@ def generate_html(all_months):
             '<div class="nav" id="nav"></div><div class="content" id="content"></div>'
             '<script>' + js + '</script></body></html>')
 
+
 def push_github(html):
     if not GITHUB_TOKEN:
         log.error("DASH_GITHUB_TOKEN yoq - push qilinmadi")
@@ -422,6 +485,7 @@ def push_github(html):
     except Exception as e:
         log.error("push error: %s", e)
         return False
+
 
 if __name__ == "__main__":
     import time
